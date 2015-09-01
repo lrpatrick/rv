@@ -22,7 +22,6 @@ import numpy as np
 from scipy.interpolate import UnivariateSpline
 from scipy.io.idl import readsav
 
-# import AR
 import CrossCorrelate as cc
 from degrade import degrader
 from kmostcorr import rescale
@@ -105,7 +104,7 @@ def wraprv(scipath, ftell):
     hcorr = float(hcorr)
     # scipath = '../KMOSreduction/spark-1.3.3/KMOSscience/'
     # ftell = '../telluric_correction/tellurics/kmo-1.3.0/telluric_YJYJYJ_3072.fits'
-    scifiles = sorted(glob.glob(scipath + '*sci_combined_N*'))
+    scifiles = sorted(glob.glob(scipath + '*sci_combined_*'))
 
     # Avoid repeating this procedure by assuming all spectra have same x-axis
     tmpsci = SciComb(pyfits.open(scifiles[0]))
@@ -122,20 +121,22 @@ def wraprv(scipath, ftell):
     name = []
     tcspec = []
     strest = []
+    rvwhole = []
 
     for scifile in scifiles:
         print('[INFO] Use rv.rv for ', scifile)
-        namei, tcspeci, rvi, erri, sr = rv(scifile, ftell, atspec, hcorr)
+        namei, tcspeci, rvi, erri, sr, rvwi = rv(scifile, ftell, atspec, hcorr)
         rvall = np.append(rvall, rvi)
         rvstd = np.append(rvstd, erri)
         name = np.append(name, namei)
         tcspec = np.append(tcspec, tcspeci)
         strest = np.append(strest, sr)
-    print('--'*10)
+        rvwhole = np.append(rvwhole, rvwi)
+    print('--'*30)
     print('[INFO] Average RV for the sample: {} +/- {}'.format(rvall.mean(),
                                                                rvall.std()))
-    print('--'*10)
-    return name, tcspec, rvall, rvstd, strest
+    print('--'*30)
+    return name, tcspec, rvall, rvstd, strest, rvwhole
 
 
 def writervfile(fname, head, names, rvs, errs):
@@ -144,20 +145,13 @@ def writervfile(fname, head, names, rvs, errs):
 
 
 def rv(fsci, ftell, atspec, hcorr):
-    """Calculate RV for a science spectrum extracted from brighest pixel"""
-
+    """
+        Calculate RV for a science spectrum extracted from brighest pixel
+        Initial guess comes from a cross-correlation for the entire region
+        This is then improved upon by using specific lines and regions within
+        the 1.17-1.22um region.
+    """
     scic = SciComb(pyfits.open(fsci))
-    # print('[INFO] Match sampling and degrade atmos. spec. to match observed')
-    # atssam = resam(xat_hres, atspec_hres, scic.x)
-    # # Clean up edges -- taken from N6822_Vrad.v2.py -- is this necesssary?
-    # atssam[np.where(atssam < 0.0)[0]] = 0
-    # print('[INFO] Degrade atmos spec to match science:')
-    # # From ESO's ISAAC decommissioned webpages R = 40000
-    # atspec = degrader(scic.x, atssam, 40000, 3000)
-    # Degrade then resample:
-    # atdeg = degrader(xat_hres, atspec_hres, 40000, 3000)
-    # atspec = resam(xat_hres, atdeg, scic.x)
-
     # For cross-correlation to rest use telluric index:
     it = np.where((scic.x > 1.12) & (scic.x < 1.15))[0]
     xtell = scic.x[it]
@@ -180,39 +174,86 @@ def rv(fsci, ftell, atspec, hcorr):
 
     # Prepare fake spectrum:
     # Match sampling between fake spectrum and observations
-    fxtrim, ftrim = trimspec(scic.x, fx, fspec)
     # Degrade & resample:
     fsam = resam(fx, fspec, scic.x)
-
-    # Degrade atmos spec to match science:
-    # fdeg = degrader(scic.x, fsam, 10000, 10000)
-    fdiag = fsam[scic.roi]
+    fdeg = degrader(scic.x, fsam, 10000, 3000)
+    fdiag = fdeg[scic.roi]
     print('[INFO] Calculate RV shift:')
-    scirv, rvs = cc.ccshift(scitc.tcor, fdiag, xdiag, quiet=False)
+    scirv, rvs = cc.ccshift(fdiag, scitc.tcor, xdiag, quiet=False, width=20)
     rvkms = lambda shift, delta, lam: shift*delta*C / lam
-    rvi = rvkms(rvs, scic.delt, 1.2)
-
+    rvi = rvkms(rvs*-1, scic.delt, 1.2)
+    rvall = rvcorr(rvi, hcorr)
+    print('[INFO] RV derived using the whole region: {}'.format(rvall))
     # Calculate errors:
-    slbl = linebyline(xdiag, scitc.tcor, fdiag)
+    slbl = linebyline(xdiag, scirv, fdiag) + rvs*-1
     slbl = slbl[np.where(slbl != 0.0)]
     rvlbl = rvkms(slbl, scic.delt, 1.2)
     avrv = rvcorr(np.mean(rvlbl), hcorr)
     erv = np.std(rvlbl) / np.sqrt(np.shape(rvlbl)[0])
-    print('[INFO] Average RV line by line: ', avrv, '+/-', erv)
-    print('[INFO] RV derived using the whole region: ', rvcorr(rvi, hcorr))
-    return scic, scitc, avrv, erv, sr
+    print('[INFO] Average RV line by line: {} +/- {}'.format(avrv, erv))
+    print('[INFO] RVs: {}'.format(rvcorr(rvlbl, hcorr)))
+    return scic, scitc, avrv, erv, sr, rvall,
 
-# rvb = np.zeros((np.shape(errall)[0], 2))
-# rvb[:, 1][3:] = errall[:-3]
-# rvb[:, 0][3:] = rvall[:-3]
-# rvb[:, 0][0:3] = rvall[-3:]
-# rvb[:, 1][0:3] = errall[-3:]
-# plt.errorbar(np.arange(0, np.shape(rvpub)[0]), rvpub[:, 0],
-#              yerr=rvpub[:, 1], fmt='o', color='blue')
-# plt.errorbar(np.arange(0, np.shape(rvpub)[0]), sortedrvs[:, 0],
-#              yerr=sortedrvs[:, 1], fmt='o', color='green')
-# plt.errorbar(np.arange(0, np.shape(rvpub)[0]), rvsnew[:, 0],
-#              yerr=rvsnew[:, 1], fmt='o', color='red')
+
+# def rvold(fsci, ftell, atspec, hcorr):
+#     """Calculate RV for a science spectrum extracted from brighest pixel"""
+
+#     scic = SciComb(pyfits.open(fsci))
+#     # print('[INFO] Match sampling and degrade atmos. spec. to match obs.')
+#     # atssam = resam(xat_hres, atspec_hres, scic.x)
+#     # # Clean up edges -- taken from N6822_Vrad.v2.py -- is this necesssary?
+#     # atssam[np.where(atssam < 0.0)[0]] = 0
+#     # print('[INFO] Degrade atmos spec to match science:')
+#     # # From ESO's ISAAC decommissioned webpages R = 40000
+#     # atspec = degrader(scic.x, atssam, 40000, 3000)
+#     # Degrade then resample:
+#     # atdeg = degrader(xat_hres, atspec_hres, 40000, 3000)
+#     # atspec = resam(xat_hres, atdeg, scic.x)
+
+#     # For cross-correlation to rest use telluric index:
+#     it = np.where((scic.x > 1.12) & (scic.x < 1.15))[0]
+#     xtell = scic.x[it]
+#     scixtell = scic.bspec[it]
+#     atxtell = atspec[it]
+#     scixtell_, sr = cc.ccshift(atxtell, scixtell, xtell, quiet=False)
+
+#     # Implement shift-to-rest (sr) in diagnostic region
+#     xdiag = scic.x[scic.roi]
+#     scidiag = scic.bspec[scic.roi]
+#     atdiag = atspec[scic.roi]
+#     print('[INFO] Shift science spectrum to rest using telluric features:')
+#     scirest, s2 = cc.ccshift(atdiag, scidiag, xdiag, shift1=sr, quiet=False)
+
+#     # Telluric correct:
+#     print('[INFO] Telluric correct data once shifted onto rest wavelength:')
+#     tellcube = TellCube(ftell)
+#     tspec = tellcube.data[scic.ifu - 1].data
+#     scitc = TellCor(scirest, tspec[scic.roi], scic.x[scic.roi])
+
+#     # Prepare fake spectrum:
+#     # Match sampling between fake spectrum and observations
+#     fxtrim, ftrim = trimspec(scic.x, fx, fspec)
+#     # Degrade & resample:
+#     fsam = resam(fx, fspec, scic.x)
+
+#     # Degrade atmos spec to match science:
+#     fdeg = degrader(scic.x, fsam, 10000, 3000)
+#     fdiag = fdeg[scic.roi]
+#     print('[INFO] Calculate RV shift:')
+#     scirv, rvs = cc.ccshift(scitc.tcor, fdiag, xdiag, quiet=False, width=20)
+#     rvkms = lambda shift, delta, lam: shift*delta*C / lam
+#     rvi = rvkms(rvs, scic.delt, 1.2)
+#     rvall = rvcorr(rvi, hcorr)
+#     # Calculate errors:
+#     slbl = linebyline(xdiag, scitc.tcor, fdiag)
+#     slbl = slbl[np.where(slbl != 0.0)]
+#     rvlbl = rvkms(slbl, scic.delt, 1.2)
+#     avrv = rvcorr(np.mean(rvlbl), hcorr)
+#     erv = np.std(rvlbl) / np.sqrt(np.shape(rvlbl)[0])
+#     print('[INFO] Average RV line by line: {} +/- {}'.format(avrv, erv))
+#     print('[INFO] RVs: {}'.format(rvcorr(rvlbl, hcorr)))
+#     print('[INFO] RV derived using the whole region: {}'.format(rvall))
+#     return scic, scitc, avrv, erv, sr, rvall
 
 
 def rvcorr(rv, hcorr):
@@ -238,19 +279,12 @@ def defidx(w1):
 
 
 def linebyline(x, tcspec, fspec):
-    """
-        Calculate shift to rest wavelength for each line individually
-    """
+    """Calculate radial velocity shift for groups of lines individually"""
     lines = defidx(x)
     # wid = 0.0010
     slbl = []
     for l in lines:
-        # lidx = np.where((x > l - wid) & (x < l + wid))[0]
-        # Generate fake spectrum with one line surrounded by ones:
-        # fones = onespec(x, fspec[lidx], lidx)
-        slbli, tmp = cc.crossc(fspec, tcspec,
-                               i1=l[0], i2=l[-1])
-
+        slbli, tmp = cc.crossc(fspec, tcspec, i1=l[0], i2=l[-1])
         slbl = np.append(slbl, slbli*-1)
     return slbl
 
