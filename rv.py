@@ -42,10 +42,10 @@ xat_hres = lamaxis(atmos[0].header['CRVAL1'], atmos[0].header['CDELT1'],
                    np.shape(atspec_hres)[0])*10**-4
 
 # Fake spectra:
-allgrid = readsav('/home/lee/Work/RSG-JAnal/models/MODELSPEC_2013sep12_nLTE_R10000_J_turb_abun_grav_temp-int.sav')
+# allgrid = readsav('/home/lee/Work/RSG-JAnal/models/MODELSPEC_2013sep12_nLTE_R10000_J_turb_abun_grav_temp-int.sav')
 # fspec = allgrid['modelspec'][0][0][0, 0, 0, 6]
-fspec = allgrid['modelspec'][0][0][13, 4, 5, 6]
-fx = allgrid['modelspec'][0][2]
+# # fspec = allgrid['modelspec'][0][0][5, 5, 5, 6]
+# fx = allgrid['modelspec'][0][2]
 
 
 lines = np.genfromtxt('/home/lee/Work/python/lib/lines.txt')[:, 1]
@@ -92,7 +92,7 @@ class TellCor(object):
         self.tcor = self.sci / self.tsr
 
 
-def wraprv(scipath, ftell):
+def wraprv(scipath, ftell, rsgmod, xrsg):
     """
         Wrap the rv.rv routine by giving it a list of spectra
 
@@ -102,8 +102,6 @@ def wraprv(scipath, ftell):
     """
     hcorr = raw_input('[INFO] Please enter heliocentric corr. for target:\n')
     hcorr = float(hcorr)
-    # scipath = '../KMOSreduction/spark-1.3.3/KMOSscience/'
-    # ftell = '../telluric_correction/tellurics/kmo-1.3.0/telluric_YJYJYJ_3072.fits'
     scifiles = sorted(glob.glob(scipath + '*sci_combined_*'))
 
     # Avoid repeating this procedure by assuming all spectra have same x-axis
@@ -125,7 +123,8 @@ def wraprv(scipath, ftell):
 
     for scifile in scifiles:
         print('[INFO] Use rv.rv for ', scifile)
-        namei, tcspeci, rvi, erri, sr, rvwi = rv(scifile, ftell, atspec, hcorr)
+        namei, tcspeci, rvi, erri, sr, rvwi = rv(scifile, ftell, rsgmod, xrsg,
+                                                 atspec, hcorr)
         rvall = np.append(rvall, rvi)
         rvstd = np.append(rvstd, erri)
         name = np.append(name, namei)
@@ -144,7 +143,7 @@ def writervfile(fname, head, names, rvs, errs):
     np.savetxt(fname, out, header=head, fmt='%s')
 
 
-def rv(fsci, ftell, atspec, hcorr):
+def rv(fsci, ftell, rsgmod, xrsg, atspec, hcorr):
     """
         Calculate RV for a science spectrum extracted from brighest pixel
         Initial guess comes from a cross-correlation for the entire region
@@ -175,7 +174,7 @@ def rv(fsci, ftell, atspec, hcorr):
     # Prepare fake spectrum:
     # Match sampling between fake spectrum and observations
     # Degrade & resample:
-    fsam = resam(fx, fspec, scic.x)
+    fsam = resam(xrsg, rsgmod, scic.x)
     fdeg = degrader(scic.x, fsam, 10000, 3000)
     fdiag = fdeg[scic.roi]
     print('[INFO] Calculate RV shift:')
@@ -192,7 +191,69 @@ def rv(fsci, ftell, atspec, hcorr):
     erv = np.std(rvlbl) / np.sqrt(np.shape(rvlbl)[0])
     print('[INFO] Average RV line by line: {} +/- {}'.format(avrv, erv))
     print('[INFO] RVs: {}'.format(rvcorr(rvlbl, hcorr)))
-    return scic, scitc, avrv, erv, sr, rvall,
+    return scic, scitc, avrv, erv, sr, rvcorr(rvlbl, hcorr)
+
+
+def rvcorr(rv, hcorr):
+    """
+        Correct the radial velocity
+            1. Heliocentric correction from ESO's airmass calculator
+            2. Difference between vacuum and air
+    """
+    # hcorr = 7.75
+    airvac = 82.22
+    return rv + hcorr - airvac
+
+
+def defidx(w1):
+    """Define regions with strong lines to compute cross-correlation"""
+    idx = [np.where((w1 > 1.1760) & (w1 < 1.1805))[0]]
+    idx.append(np.where((w1 > 1.1820) & (w1 < 1.18495))[0])
+    idx.append(np.where((w1 > 1.1869) & (w1 < 1.1899))[0])
+    idx.append(np.where((w1 > 1.1965) & (w1 < 1.19986))[0])
+    idx.append(np.where((w1 > 1.20133) & (w1 < 1.205))[0])
+    idx.append(np.where((w1 > 1.20691) & (w1 < 1.2124))[0])
+    return idx
+
+
+def linebyline(x, tcspec, fspec):
+    """Calculate radial velocity shift for groups of lines individually"""
+    lines = defidx(x)
+    # wid = 0.0010
+    slbl = []
+    for l in lines:
+        slbli, tmp = cc.crossc(fspec, tcspec, i1=l[0], i2=l[-1])
+        slbl = np.append(slbl, slbli*-1)
+    return slbl
+
+
+def brighest_pix(data):
+    """
+        Define the brightest pixel from a 3D data cube the median along the
+        spectral axis
+
+        Arguments:
+        data : numpy.ndarray
+            3D data cube from a reconstructed KMOS IFU
+
+        Output:
+        x, y : int
+            index of the brightest pixel within the array
+    """
+    med_spec = np.median(data, axis=0)
+    x, y = np.unravel_index(med_spec.argmax(), med_spec.shape)
+    return x, y
+
+
+def resam(x, y, xnew):
+    s = UnivariateSpline(x, y, s=1)
+    return s(xnew)
+
+
+def trimspec(w1, w2, s2):
+    """Trim s2 and w2 to match w1"""
+    roi = np.where((w2 > w1.min()) & (w2 < w1.max()))[0]
+    return w2[roi], s2[roi]
 
 
 # def rvold(fsci, ftell, atspec, hcorr):
@@ -256,39 +317,6 @@ def rv(fsci, ftell, atspec, hcorr):
 #     return scic, scitc, avrv, erv, sr, rvall
 
 
-def rvcorr(rv, hcorr):
-    """
-        Correct the radial velocity
-            1. Heliocentric correction from ESO's airmass calculator
-            2. Difference between vacuum and air
-    """
-    # hcorr = 7.75
-    airvac = 82.22
-    return rv + hcorr - airvac
-
-
-def defidx(w1):
-    """Define regions with strong lines to compute cross-correlation"""
-    idx = [np.where((w1 > 1.1760) & (w1 < 1.1805))[0]]
-    idx.append(np.where((w1 > 1.1820) & (w1 < 1.18495))[0])
-    idx.append(np.where((w1 > 1.1869) & (w1 < 1.1899))[0])
-    idx.append(np.where((w1 > 1.1965) & (w1 < 1.19986))[0])
-    idx.append(np.where((w1 > 1.20133) & (w1 < 1.205))[0])
-    idx.append(np.where((w1 > 1.20691) & (w1 < 1.2124))[0])
-    return idx
-
-
-def linebyline(x, tcspec, fspec):
-    """Calculate radial velocity shift for groups of lines individually"""
-    lines = defidx(x)
-    # wid = 0.0010
-    slbl = []
-    for l in lines:
-        slbli, tmp = cc.crossc(fspec, tcspec, i1=l[0], i2=l[-1])
-        slbl = np.append(slbl, slbli*-1)
-    return slbl
-
-
 def onespec(x, line, lidx):
     """
         Create a spectrum of ones with a spectral line imprinted
@@ -306,32 +334,3 @@ def onespec(x, line, lidx):
     fline = np.ones(x.shape)
     fline[lidx] = line
     return fline
-
-
-def brighest_pix(data):
-    """
-        Define the brightest pixel from a 3D data cube the median along the
-        spectral axis
-
-        Arguments:
-        data : numpy.ndarray
-            3D data cube from a reconstructed KMOS IFU
-
-        Output:
-        x, y : int
-            index of the brightest pixel within the array
-    """
-    med_spec = np.median(data, axis=0)
-    x, y = np.unravel_index(med_spec.argmax(), med_spec.shape)
-    return x, y
-
-
-def resam(x, y, xnew):
-    s = UnivariateSpline(x, y, s=1)
-    return s(xnew)
-
-
-def trimspec(w1, w2, s2):
-    """Trim s2 and w2 to match w1"""
-    roi = np.where((w2 > w1.min()) & (w2 < w1.max()))[0]
-    return w2[roi], s2[roi]
